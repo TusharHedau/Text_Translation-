@@ -1,0 +1,507 @@
+"""Fine-tuning training runner for Sanskrit OCR using PaddlePaddle & CTC Loss.
+
+Trains a CRNN / sequence recognition model on multi-domain Sanskrit text lines
+(digital, handwritten, and ancient manuscripts) and exports fine-tuned checkpoints.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+# Ensure safe console output on Windows
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+import cv2
+import numpy as np
+import paddle
+import paddle.nn as nn
+from paddle.io import DataLoader, Dataset
+
+
+# ---------------------------------------------------------------------------
+# Character Dictionary & Label Converter
+# ---------------------------------------------------------------------------
+
+class SanskritLabelConverter:
+    """Encodes Devanagari text into token integer indices for CTC loss."""
+
+    def __init__(self, dict_path: str | Path) -> None:
+        self.dict_path = Path(dict_path)
+        self.char_to_id: Dict[str, int] = {}
+        self.id_to_char: Dict[int, str] = {}
+
+        # Index 0 is reserved for CTC blank token
+        self.blank_id = 0
+        self.id_to_char[0] = ""
+
+        current_id = 1
+        if self.dict_path.exists():
+            with open(self.dict_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    ch = line.strip("\r\n")
+                    if ch and ch not in self.char_to_id:
+                        self.char_to_id[ch] = current_id
+                        self.id_to_char[current_id] = ch
+                        current_id += 1
+
+        # Space character
+        if " " not in self.char_to_id:
+            self.char_to_id[" "] = current_id
+            self.id_to_char[current_id] = " "
+            current_id += 1
+
+        self.num_classes = current_id
+
+    def encode(self, text: str) -> List[int]:
+        """Convert a Sanskrit text string to a list of token IDs."""
+        ids: List[int] = []
+        for ch in text:
+            if ch in self.char_to_id:
+                ids.append(self.char_to_id[ch])
+            elif ch != "\t" and ch != "\n":
+                # Unknown characters map to blank or skip
+                pass
+        return ids
+
+    def decode(self, ids: List[int]) -> str:
+        """Decode greedy CTC sequence IDs to a Sanskrit string."""
+        chars: List[str] = []
+        prev_id = -1
+        for idx in ids:
+            if idx != prev_id and idx != self.blank_id:
+                chars.append(self.id_to_char.get(idx, ""))
+            prev_id = idx
+        return "".join(chars)
+
+
+# ---------------------------------------------------------------------------
+# Dataset for Cropped Text Lines
+# ---------------------------------------------------------------------------
+
+class SanskritLineDataset(Dataset):
+    """Paddle Dataset for loading and resizing Sanskrit line images with in-memory caching."""
+
+    def __init__(
+        self,
+        data_dir: Path,
+        label_file: Path,
+        converter: SanskritLabelConverter,
+        target_h: int = 48,
+        target_w: int = 320,
+        max_len: int = 64,
+        is_training: bool = False,
+        max_samples: Optional[int] = None,
+    ) -> None:
+        super().__init__()
+        self.data_dir = data_dir
+        self.converter = converter
+        self.target_h = target_h
+        self.target_w = target_w
+        self.max_len = max_len
+        self.is_training = is_training
+        self.samples: List[Tuple[str, str]] = []
+
+        if label_file.exists():
+            with open(label_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    parts = line.strip("\r\n").split("\t")
+                    if len(parts) >= 2:
+                        rel_path, text = parts[0], parts[1]
+                        full_path = self.data_dir / rel_path
+                        if full_path.exists():
+                            self.samples.append((str(full_path), text))
+
+        if max_samples is not None and len(self.samples) > max_samples:
+            import random
+            rng = random.Random(42)
+            rng.shuffle(self.samples)
+            self.samples = self.samples[:max_samples]
+
+        # Pre-process and cache all samples in memory for instantaneous epoch iterations
+        self.cached_chw: List[np.ndarray] = []
+        self.cached_padded_ids: List[np.ndarray] = []
+        self.cached_lengths: List[int] = []
+
+        for img_path, text in self.samples:
+            img = cv2.imread(img_path)
+            if img is None:
+                img = np.ones((self.target_h, self.target_w, 3), dtype=np.uint8) * 255
+
+            # Training data augmentation
+            if self.is_training:
+                # Slight random contrast / brightness
+                if np.random.rand() > 0.4:
+                    alpha = float(np.random.uniform(0.85, 1.15))
+                    beta = float(np.random.uniform(-10, 10))
+                    img = np.clip(img.astype(np.float32) * alpha + beta, 0, 255).astype(np.uint8)
+                # Slight blur
+                if np.random.rand() > 0.6:
+                    img = cv2.GaussianBlur(img, (3, 3), 0.5)
+
+            h, w = img.shape[:2]
+            ratio = float(self.target_h) / max(1, h)
+            new_w = min(self.target_w, max(1, int(w * ratio)))
+            resized = cv2.resize(img, (new_w, self.target_h))
+
+            canvas = np.ones((self.target_h, self.target_w, 3), dtype=np.uint8) * 255
+            canvas[:, :new_w] = resized
+
+            normalized = (canvas.astype(np.float32) / 127.5) - 1.0
+            chw = np.transpose(normalized, (2, 0, 1))
+
+            token_ids = self.converter.encode(text)[:self.max_len]
+            length = len(token_ids)
+            if length == 0:
+                continue  # Avoid zero-length targets which cause NaN in CTC loss
+
+            padded_ids = np.zeros((self.max_len,), dtype=np.int32)
+            padded_ids[:length] = token_ids
+
+            self.cached_chw.append(chw)
+            self.cached_padded_ids.append(padded_ids)
+            self.cached_lengths.append(length)
+
+    def __len__(self) -> int:
+        return len(self.cached_lengths)
+
+    def __getitem__(self, idx: int):
+        return (
+            paddle.to_tensor(self.cached_chw[idx], dtype="float32"),
+            paddle.to_tensor(self.cached_padded_ids[idx], dtype="int32"),
+            paddle.to_tensor(self.cached_lengths[idx], dtype="int64"),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Sanskrit CRNN Recognition Architecture
+# ---------------------------------------------------------------------------
+
+class SanskritCRNN(nn.Layer):
+    """Lightweight Convolutional Recurrent Network for Sanskrit OCR."""
+
+    def __init__(self, num_classes: int) -> None:
+        super().__init__()
+        # Feature extraction (CNN)
+        self.features = nn.Sequential(
+            nn.Conv2D(3, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2D(64),
+            nn.ReLU(),
+            nn.MaxPool2D(kernel_size=2, stride=2),  # -> 24 x 160
+
+            nn.Conv2D(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2D(128),
+            nn.ReLU(),
+            nn.MaxPool2D(kernel_size=2, stride=2),  # -> 12 x 80
+
+            nn.Conv2D(128, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2D(256),
+            nn.ReLU(),
+
+            nn.Conv2D(256, 256, kernel_size=(3, 1), padding=(1, 0)),
+            nn.BatchNorm2D(256),
+            nn.ReLU(),
+            nn.MaxPool2D(kernel_size=(2, 1), stride=(2, 1)),  # -> 6 x 80
+
+            nn.Conv2D(256, 512, kernel_size=3, padding=1),
+            nn.BatchNorm2D(512),
+            nn.ReLU(),
+            nn.MaxPool2D(kernel_size=(2, 1), stride=(2, 1)),  # -> 3 x 80
+
+            nn.Conv2D(512, 512, kernel_size=(3, 1), padding=0),  # -> 1 x 80
+            nn.BatchNorm2D(512),
+            nn.ReLU(),
+        )
+
+        # Sequence modeling (Bidirectional GRU)
+        self.rnn = nn.GRU(
+            input_size=512,
+            hidden_size=256,
+            num_layers=2,
+            direction="bidirectional",
+            time_major=False,
+        )
+
+        # Output projection for CTC classes (characters + blank)
+        self.fc = nn.Linear(512, num_classes)
+
+    def forward(self, x: paddle.Tensor) -> paddle.Tensor:
+        # x: [B, 3, 48, 320]
+        feats = self.features(x)  # [B, 512, 1, 80]
+        feats = paddle.squeeze(feats, axis=2)  # [B, 512, 80]
+        feats = paddle.transpose(feats, perm=[0, 2, 1])  # [B, 80, 512]
+
+        rnn_out, _ = self.rnn(feats)  # [B, 80, 512]
+        logits = self.fc(rnn_out)  # [B, 80, num_classes]
+        return logits
+
+
+# ---------------------------------------------------------------------------
+# Training & Validation Runner
+# ---------------------------------------------------------------------------
+
+def safe_paddle_save(state_dict: dict, file_path: Path, max_retries: int = 5) -> None:
+    """Safely save PaddlePaddle state_dict avoiding Windows/OneDrive file lock conflicts."""
+    file_path = Path(file_path)
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = file_path.parent / f"tmp_{int(time.time() * 1000)}_{os.getpid()}_{file_path.name}"
+    
+    try:
+        paddle.save(state_dict, str(temp_path))
+    except Exception:
+        # Fallback to direct save
+        paddle.save(state_dict, str(file_path))
+        return
+
+    for attempt in range(max_retries):
+        try:
+            if file_path.exists():
+                try:
+                    os.remove(file_path)
+                except Exception:
+                    pass
+            os.replace(temp_path, file_path)
+            return
+        except Exception:
+            time.sleep(1.0)
+
+    try:
+        import shutil
+        shutil.copyfile(str(temp_path), str(file_path))
+        try:
+            os.remove(temp_path)
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"[!] Warning: safe_paddle_save final fallback: {e}", flush=True)
+
+def train_sanskrit_ocr(
+    data_dir: Path,
+    dict_path: Path,
+    output_dir: Path,
+    train_label: Optional[str | Path] = None,
+    val_label: Optional[str | Path] = None,
+    epochs: int = 5,
+    batch_size: int = 16,
+    learning_rate: float = 0.0005,
+    max_train_samples: Optional[int] = None,
+    max_val_samples: Optional[int] = None,
+    dry_run: bool = False,
+) -> None:
+    """Run fine-tuning training loop on Sanskrit multi-domain lines."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    converter = SanskritLabelConverter(dict_path)
+    print(f"[*] Loaded Sanskrit character dictionary: {converter.num_classes} classes (including blank)", flush=True)
+
+    train_label_file = Path(train_label) if train_label else (data_dir / "train_labels.txt")
+    if not train_label_file.exists():
+        train_label_file = data_dir / "train.txt"
+
+    val_label_file = Path(val_label) if val_label else (data_dir / "val_labels.txt")
+    if not val_label_file.exists():
+        val_label_file = data_dir / "val.txt"
+
+    train_dataset = SanskritLineDataset(data_dir, train_label_file, converter, is_training=True, max_samples=max_train_samples)
+    val_dataset = SanskritLineDataset(data_dir, val_label_file, converter, is_training=False, max_samples=max_val_samples)
+
+    print(f"[*] Training samples: {len(train_dataset)}, Validation samples: {len(val_dataset)}", flush=True)
+    if len(train_dataset) == 0:
+        print(f"[!] No training samples found in {train_label_file}.", flush=True)
+        return
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=False)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, drop_last=False)
+
+    model = SanskritCRNN(num_classes=converter.num_classes)
+    weights_path = output_dir / "best_model.pdparams"
+    if weights_path.exists():
+        try:
+            state = paddle.load(str(weights_path))
+            if state.get("fc.weight") is not None and state["fc.weight"].shape == model.fc.weight.shape:
+                model.set_state_dict(state)
+                print(f"[+] Loaded pretrained weights from {weights_path} for warm-start", flush=True)
+            else:
+                filtered_state = {k: v for k, v in state.items() if not k.startswith("fc.")}
+                model.set_state_dict(filtered_state)
+                print(f"[+] Transferred {len(filtered_state)} feature extraction layers from previous checkpoint", flush=True)
+        except Exception as e:
+            print(f"[*] Starting fresh initialization: {e}", flush=True)
+
+    ctc_loss = nn.CTCLoss(blank=0, reduction="mean")
+    lr_scheduler = paddle.optimizer.lr.CosineAnnealingDecay(learning_rate=learning_rate, T_max=epochs, eta_min=0.00005)
+    
+    grad_clip = None
+    if hasattr(paddle.nn, "ClipGradByNorm"):
+        grad_clip = paddle.nn.ClipGradByNorm(clip_norm=5.0)
+    elif hasattr(paddle.optimizer, "ClipGradByNorm"):
+        grad_clip = paddle.optimizer.ClipGradByNorm(clip_norm=5.0)
+
+    optimizer = paddle.optimizer.Adam(
+        learning_rate=lr_scheduler,
+        parameters=model.parameters(),
+        grad_clip=grad_clip,
+    )
+
+    if dry_run:
+        print("[*] Dry run mode enabled: executing single batch check...", flush=True)
+        for imgs, labels, lengths in train_loader:
+            logits = model(imgs)
+            log_probs = paddle.nn.functional.log_softmax(logits, axis=2)
+            log_probs_tbc = paddle.transpose(log_probs, perm=[1, 0, 2])
+            input_lengths = paddle.full([imgs.shape[0]], logits.shape[1], dtype="int64")
+            loss = ctc_loss(log_probs_tbc, labels, input_lengths, lengths)
+            loss_val = float(loss.item())
+            if np.isnan(loss_val) or np.isinf(loss_val):
+                print(f"[!] Dry run encountered non-finite CTC loss: {loss_val}", flush=True)
+            else:
+                print(f"[+] Dry run pass successful! Computed CTC loss: {loss_val:.4f}", flush=True)
+            break
+        return
+
+    print("=" * 65, flush=True)
+    print(f"[*] STARTING SANSKRIT MULTI-DOMAIN FINE-TUNING ({epochs} Epochs)", flush=True)
+    print("=" * 65, flush=True)
+
+    best_val_loss = float("inf")
+    best_state_dict = None
+    start_time = time.time()
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        total_loss = 0.0
+        batches = 0
+
+        for imgs, labels, lengths in train_loader:
+            optimizer.clear_grad()
+            logits = model(imgs)  # [B, T, NumClasses]
+            log_probs = paddle.nn.functional.log_softmax(logits, axis=2)
+            log_probs_tbc = paddle.transpose(log_probs, perm=[1, 0, 2])
+            input_lengths = paddle.full([imgs.shape[0]], logits.shape[1], dtype="int64")
+
+            loss = ctc_loss(log_probs_tbc, labels, input_lengths, lengths)
+            loss_val = float(loss.item())
+
+            # Numerical stability: skip batch if CTC loss produces NaN or Inf
+            if np.isnan(loss_val) or np.isinf(loss_val):
+                print(f"  [!] Warning: Non-finite loss ({loss_val}) at Epoch {epoch}. Skipping batch.", flush=True)
+                continue
+
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss_val
+            batches += 1
+            if batches % 10 == 0 or batches == len(train_loader):
+                print(f"  [Epoch {epoch:02d}] Batch [{batches:02d}/{len(train_loader):02d}] CTC Loss: {loss_val:.4f}", flush=True)
+
+        avg_train_loss = total_loss / max(1, batches)
+
+        # Validation pass
+        model.eval()
+        val_loss = 0.0
+        val_batches = 0
+        with paddle.no_grad():
+            for v_imgs, v_labels, v_lengths in val_loader:
+                v_logits = model(v_imgs)
+                v_log_probs = paddle.nn.functional.log_softmax(v_logits, axis=2)
+                v_log_probs_tbc = paddle.transpose(v_log_probs, perm=[1, 0, 2])
+                v_in_lengths = paddle.full([v_imgs.shape[0]], v_logits.shape[1], dtype="int64")
+                v_loss = ctc_loss(v_log_probs_tbc, v_labels, v_in_lengths, v_lengths)
+                v_loss_val = float(v_loss.item())
+                if not (np.isnan(v_loss_val) or np.isinf(v_loss_val)):
+                    val_loss += v_loss_val
+                    val_batches += 1
+
+        avg_val_loss = val_loss / max(1, val_batches) if val_batches > 0 else avg_train_loss
+
+        print(
+            f"--> Epoch [{epoch:02d}/{epochs:02d}] "
+            f"| Train CTC Loss: {avg_train_loss:.4f} "
+            f"| Val Loss: {avg_val_loss:.4f} "
+            f"| LR: {lr_scheduler.get_lr():.6f}",
+            flush=True,
+        )
+        lr_scheduler.step()
+
+        # Cache best model weights in memory and save checkpoint safely
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            best_state_dict = {k: v.clone() for k, v in model.state_dict().items()}
+            best_path = output_dir / "best_model.pdparams"
+            try:
+                safe_paddle_save(best_state_dict, best_path)
+            except Exception as e:
+                print(f"  [!] Note: Intermediate checkpoint save deferred: {e}", flush=True)
+
+    # Save final best model & final model checkpoints
+    best_path = output_dir / "best_model.pdparams"
+    final_path = output_dir / "final_model.pdparams"
+    if best_state_dict is not None:
+        safe_paddle_save(best_state_dict, best_path)
+    else:
+        safe_paddle_save(model.state_dict(), best_path)
+    safe_paddle_save(model.state_dict(), final_path)
+
+    meta = {
+        "num_classes": converter.num_classes,
+        "epochs": epochs,
+        "best_val_loss": best_val_loss,
+        "training_time_sec": round(time.time() - start_time, 2),
+        "domains": ["digital", "handwritten", "manuscript"],
+        "dict_path": str(dict_path),
+    }
+    with open(output_dir / "model_meta.json", "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+
+    print("=" * 65)
+    print(f"[+] Fine-tuning complete! Models saved in: {output_dir}")
+    print(f"    - Best Model:  {best_path}")
+    print(f"    - Metadata:    {output_dir / 'model_meta.json'}")
+    print("=" * 65)
+
+
+if __name__ == "__main__":
+    _base_dir = Path(__file__).resolve().parent.parent
+    _cand_data = _base_dir / "data" / "sanskrit_real_ocr"
+    _default_data = str(_cand_data) if _cand_data.exists() else "data/sanskrit_real_ocr"
+    _cand_dict = _base_dir / "data" / "sanskrit_dict.txt"
+    _default_dict = str(_cand_dict) if _cand_dict.exists() else "data/sanskrit_dict.txt"
+    _cand_out = _base_dir / "models" / "sanskrit_finetuned"
+    _default_out = str(_cand_out) if _cand_out.parent.exists() else "models/sanskrit_finetuned"
+
+    parser = argparse.ArgumentParser(description="Fine-tune Sanskrit OCR Model with CTC")
+    parser.add_argument("--data_dir", type=str, default=_default_data)
+    parser.add_argument("--train_label", type=str, default=None)
+    parser.add_argument("--val_label", type=str, default=None)
+    parser.add_argument("--dict_path", type=str, default=_default_dict)
+    parser.add_argument("--output_dir", type=str, default=_default_out)
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--lr", type=float, default=0.0005)
+    parser.add_argument("--max_train_samples", type=int, default=None)
+    parser.add_argument("--max_val_samples", type=int, default=None)
+    parser.add_argument("--dry_run", action="store_true")
+
+    args = parser.parse_args()
+    train_sanskrit_ocr(
+        data_dir=Path(args.data_dir),
+        dict_path=Path(args.dict_path),
+        output_dir=Path(args.output_dir),
+        train_label=Path(args.train_label) if args.train_label else None,
+        val_label=Path(args.val_label) if args.val_label else None,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        learning_rate=args.lr,
+        max_train_samples=args.max_train_samples,
+        max_val_samples=args.max_val_samples,
+        dry_run=args.dry_run,
+    )

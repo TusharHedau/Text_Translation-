@@ -1,0 +1,14 @@
+__pycache__/
+.venv/
+.env
+models/*
+!models/sanskrit_finetuned/
+!models/sanskrit_finetuned/**
+outputs/
+.ipynb_checkpoints/
+.pytest_cache/
+.streamlit/secrets.toml
+data/sanskrit_multidomain_dataset/
+data/processed/
+data/raw/
+
